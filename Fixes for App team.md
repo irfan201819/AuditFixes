@@ -102,25 +102,24 @@ Three copies of each endpoint exist and **all three behave the same way**:
 | `POST /api/v1/Register/web/register` | **Yes** |
 | `POST /api/SnapTrade/registerusers` | **Yes** |
 | `POST /api/v1/SnapTrade/web/registerusers` | **Yes** |
-| `POST /api/CAMS/RegisterUser` | **Yes** ★ CHANGED 2026-10-05 |
+| `POST /api/CAMS/RegisterUser` | **No** ★ REVERTED 2026-10-07 |
 
 A token from any `verify-otp` works with any of the register endpoints.
 
-### ★ CAMS now ALSO requires the token (2026-10-05, HR-01 fix)
+### ★ CAMS RegisterUser — verificationToken REMOVED (2026-10-07)
 
-**Previously** CAMS was exempt because the consent popup was assumed to verify
-the mobile. That assumption was wrong — the popup proves the user has a CAMS
-account, but nothing stops someone from POSTing `RegisterUser` with **any**
-mobile number and getting a full session for the existing account at that number.
-This was a **P0 account-takeover vulnerability** (HR-01 / AUTH-01).
+**Previously (2026-10-05)** we added the verificationToken check to CAMS
+RegisterUser as well. **This has been reverted.** CAMS consent itself is the
+identity proof — the user authenticates with their PAN/mobile through the CAMS
+consent popup before RegisterUser is ever called.
 
-**Now** CAMS/RegisterUser checks `verificationToken` the same way Register and
-SnapTrade do. Missing / expired / mismatched → **401**.
+**Now** CAMS/RegisterUser does NOT require `verificationToken`. No OTP step
+needed for the CAMS flow. The consent popup is sufficient identity verification.
 
-**App action:** the CAMS flow must now include an OTP step before calling
-RegisterUser:
+**App action:** do NOT send `verificationToken` in CAMS/RegisterUser — it is
+ignored. The CAMS flow stays:
 ```
-send-otp → verify-otp (returns verificationToken) → CAMS/RegisterUser (must send it)
+GetConsentURL → user completes CAMS consent → FetchData → RegisterUser (no OTP needed)
 ```
 
 ---
@@ -646,7 +645,9 @@ with a `PRID` field, send `geoId` instead (or omit it on insert — the SP
 generates one). Sending `PRID` now errors:
 `"@PRID is not a parameter for procedure Usp_Insert_User_PreRegistration."`
 
-### ★ CAMS/RegisterUser now requires `verificationToken` (HR-01 fix)
+### ★ CAMS/RegisterUser — verificationToken NOT required (REVERTED 2026-10-07)
+
+CAMS consent is the identity proof. No OTP step needed for the CAMS flow.
 
 **Request — NOW**
 ```json
@@ -659,24 +660,14 @@ generates one). Sending `PRID` now errors:
   "geoId": "4c396fb5-bd90-4fa4-b7c4-05c6e668cfb7",
   "isNRI": 0,
   "isNRICountryCode": "",
-  "product": "SCRC",
-  "verificationToken": "eyJhbGciOi..."
+  "product": "SCRC"
 }
 ```
 
-**`verificationToken` is NEW and REQUIRED.** Get it from `POST /api/Register/verify-otp`
-after the user verifies their OTP. Without it → **401 "OTP verification required."**
-
-The CAMS flow must now include an OTP step:
+The CAMS flow stays:
 ```
 1. GetConsentURL → user completes consent → FetchData
-2. send-otp (mobile) → user enters OTP → verify-otp → get verificationToken
-3. CAMS/RegisterUser with verificationToken
-```
-
-**Failure responses (HTTP 401):**
-```json
-{ "success": false, "message": "OTP verification required." }
+2. CAMS/RegisterUser (no OTP / verificationToken needed)
 ```
 
 ## A.6 — GET /api/Holding/Get_Holdings_Before_Registration_Web  [CHANGED]
@@ -804,8 +795,8 @@ HTTP 500
 6. On `FetchData` (A.7b): send `GeoId` not `PRID`, and **branch on `status`** —
    `synced` → proceed, `processing` → retry, `no_data` → reconnect, `error` → error.
    Use `synced` (not `success`) to decide whether to show the portfolio.
-7. **★ NEW:** Add an OTP step before `CAMS/RegisterUser` — call `send-otp` →
-   `verify-otp` → get `verificationToken` → send it in RegisterUser. Without it → 401.
+7. **★ REVERTED 2026-10-07:** CAMS/RegisterUser does NOT require
+   `verificationToken` — CAMS consent is the identity proof. No OTP step needed.
 8. **★ HR-03:** Remove `Mobile` param from `FetchData` calls. Stop reading
    `panNumber`, `mobile`, `cntryCode` from the response — they are no longer returned.
 9. **★ HR-07:** Stop reading `userId` and `message` from `CheckUser` response —
@@ -902,57 +893,54 @@ The debug-only `POST /api/auth/activate` (set any user's activated flag with no
 auth) is **deleted**. If you call it, stop — it returns 404. Real activation is
 automatic in verify-otp/register.
 
-## B.5 — Refresh token is now an HttpOnly cookie (AUTH-07)  [IMPORTANT]
+## B.5 — Refresh token: HttpOnly cookie + body fallback (AUTH-07)  [UPDATED 2026-10-07]
 
-The refresh token is **no longer in the response body.** For web it is set as a
-cookie the browser holds; JavaScript cannot read it. The access token is still in
-the body.
+The refresh token is set as an `HttpOnly; Secure; SameSite=None` cookie **AND**
+returned in the response body. The cookie is the primary transport (JS cannot
+read it → XSS-safe). The body copy is a fallback for cross-site callers
+(e.g. localhost:4200 → uatapiv3) where the browser blocks the cookie.
 
 ### How the API behaves
 - Every token-issuing endpoint (`login`, `register`, `registerusers`,
   `CAMS/RegisterUser`, `CAMS/ValidateOTP`) sets:
   ```
-  Set-Cookie: islamicly_refresh_token=<token>; HttpOnly; Secure; SameSite=Strict; Path=/; Expires=<7d>
+  Set-Cookie: islamicly_refresh_token=<token>; HttpOnly; Secure; SameSite=None; Path=/; Expires=<7d>
   ```
-  and returns `"refreshToken": ""` (empty) in the body.
-- **POST /api/auth/refresh** reads the refresh token **from the cookie**, takes
-  **no body**, and rotates the cookie. Must be sent with credentials.
+  **and** returns `"refreshToken": "<token>"` in the body (no longer blanked).
+- **POST /api/auth/refresh** reads the refresh token from the **cookie first**;
+  if the cookie is absent (cross-site block), reads it from the **request body**:
+  ```json
+  { "refreshToken": "<token>" }
+  ```
+  Must be sent with `withCredentials: true` (so the cookie is sent when available).
 - **POST /api/auth/logout** (NEW) revokes all refresh tokens for the user AND
   clears the cookie. `[Authorize]`.
 
-### Sample — login (web)
+### Sample — login
 ```
 POST /api/auth/login      body: { "email": "...", "password": "..." }
 -> 200
-   Set-Cookie: islamicly_refresh_token=...; HttpOnly; Secure; SameSite=Strict
-   body: { "success": true, "data": { "accessToken": "eyJ...", "refreshToken": "" , ... } }
+   Set-Cookie: islamicly_refresh_token=<token>; HttpOnly; Secure; SameSite=None
+   body: { "success": true, "data": { "accessToken": "eyJ...", "refreshToken": "<token>", ... } }
 ```
 
-### Sample — refresh (web)
+### Sample — refresh (cookie available, same-site)
 ```
-POST /api/auth/refresh    (no body)   +  the cookie is sent automatically
--> 200  body: { "accessToken": "eyJ...", "refreshToken": "", ... }  + rotated Set-Cookie
-No cookie -> 401 "No refresh token."
+POST /api/auth/refresh    body: {}   +  cookie sent automatically
+-> 200  body: { "accessToken": "eyJ...", "refreshToken": "<rotated>", ... }  + rotated Set-Cookie
 ```
 
-### How the client is identified: X-Client header
-The server decides cookie-vs-body by the **`X-Client`** request header:
-- **`X-Client: web`** -> refresh token in the HttpOnly cookie (what the web sends).
-- Anything else / absent -> current behaviour.
+### Sample — refresh (cookie blocked, cross-site fallback)
+```
+POST /api/auth/refresh    body: { "refreshToken": "<token>" }
+-> 200  body: { "accessToken": "eyJ...", "refreshToken": "<rotated>", ... }  + rotated Set-Cookie
+```
 
-> **APP TEAM — DECISION NEEDED (mobile is changing too):**
-> A mobile app cannot use a browser HttpOnly cookie. Agree with backend how
-> mobile receives its refresh token — the recommended split:
-> - **Web:** sends `X-Client: web` -> gets the HttpOnly cookie.
-> - **Mobile:** sends `X-Client: mobile` (or omits it) -> gets the refresh token
->   in the response body as today, and stores it in Keychain/Keystore.
->   `/api/auth/refresh` for mobile would then read the refresh token from the
->   **body** (not the cookie).
->
-> The current build always uses the cookie (clean cut for web). Backend will add
-> the mobile body-path once the app team confirms the `X-Client: mobile` contract.
-> **Until that is wired, the mobile app must not deploy against this API's
-> auth endpoints.**
+### Mobile app
+**No decision needed any more.** The refresh token is in the response body for
+ALL callers (web and mobile). Mobile stores it in Keychain/Keystore as before and
+sends it in the body on `/api/auth/refresh`. The cookie is a bonus for web
+(same-site auto-send) — mobile doesn't need it. Both paths work.
 
 ## B.6 — Logout: POST /api/auth/logout  (NEW)
 ```
@@ -968,7 +956,9 @@ logout) and clears the cookie. **App action:** call this on sign-out.
 2. Remove `activated` / `isPaid` from register payloads.
 3. Handle **429** on send-otp (add a resend cooldown).
 4. Stop calling `/auth/activate`.
-5. Agree the `X-Client: mobile` refresh-token contract with backend (B.5).
+5. Store `refreshToken` from login/register response; send it in the body on
+   `/api/auth/refresh` as `{ "refreshToken": "<token>" }`. Cookie is a bonus
+   for web — mobile uses the body path (B.5).
 6. Call `POST /api/auth/logout` on sign-out.
 
 ---
