@@ -102,24 +102,32 @@ Three copies of each endpoint exist and **all three behave the same way**:
 | `POST /api/v1/Register/web/register` | **Yes** |
 | `POST /api/SnapTrade/registerusers` | **Yes** |
 | `POST /api/v1/SnapTrade/web/registerusers` | **Yes** |
-| `POST /api/CAMS/RegisterUser` | **No** ★ REVERTED 2026-10-07 |
+| `POST /api/CAMS/RegisterUser` | **No** — CAMS consent is the identity proof |
 
 A token from any `verify-otp` works with any of the register endpoints.
 
-### ★ CAMS RegisterUser — verificationToken REMOVED (2026-10-07)
+### CAMS RegisterUser — GeoId consent validation (2026-10-07)
 
-**Previously (2026-10-05)** we added the verificationToken check to CAMS
-RegisterUser as well. **This has been reverted.** CAMS consent itself is the
-identity proof — the user authenticates with their PAN/mobile through the CAMS
-consent popup before RegisterUser is ever called.
+CAMS/RegisterUser does **not** require `verificationToken`. Instead, it now
+validates the **GeoId** — the server checks that the GeoId resolves to a valid
+pre-registration record (PRID) created during the CAMS consent flow.
 
-**Now** CAMS/RegisterUser does NOT require `verificationToken`. No OTP step
-needed for the CAMS flow. The consent popup is sufficient identity verification.
+**What changed:** Before this fix, anyone could call `CAMS/RegisterUser` with
+any mobile number and create an account — no proof of identity needed. Now the
+endpoint verifies the caller actually completed the CAMS consent by checking
+that the `geoId` in the request maps to a real pre-registration session.
 
-**App action:** do NOT send `verificationToken` in CAMS/RegisterUser — it is
-ignored. The CAMS flow stays:
+**New error responses (401):**
+- `"CAMS consent not found. Please complete the consent process before registering."`
+  → The `geoId` is missing, invalid, or doesn't match any consent session.
+
+**App action:**
+- Always send `geoId` in the `CAMS/RegisterUser` request body (you should already be doing this).
+- Handle **401** — show the error message to the user.
+- No `verificationToken` needed — the GeoId consent check replaces it.
+- The flow remains:
 ```
-GetConsentURL → user completes CAMS consent → FetchData → RegisterUser (no OTP needed)
+GetConsentURL → user completes CAMS consent → FetchData → RegisterUser (geoId required)
 ```
 
 ---
@@ -645,9 +653,11 @@ with a `PRID` field, send `geoId` instead (or omit it on insert — the SP
 generates one). Sending `PRID` now errors:
 `"@PRID is not a parameter for procedure Usp_Insert_User_PreRegistration."`
 
-### ★ CAMS/RegisterUser — verificationToken NOT required (REVERTED 2026-10-07)
+### CAMS/RegisterUser — GeoId consent validation (2026-10-07)
 
-CAMS consent is the identity proof. No OTP step needed for the CAMS flow.
+No `verificationToken` needed. Instead, the server validates `geoId` — it must
+resolve to a valid pre-registration record (created during the CAMS consent).
+Without a valid `geoId`, the endpoint returns **401**.
 
 **Request — NOW**
 ```json
@@ -657,17 +667,22 @@ CAMS consent is the identity proof. No OTP step needed for the CAMS flow.
   "country": "IND",
   "email": "",
   "prid": 0,
-  "geoId": "4c396fb5-bd90-4fa4-b7c4-05c6e668cfb7",
+  "geoId": "4c396fb5-bd90-4fa4-b7c4-05c6e668cfb7",   // ← REQUIRED, validated
   "isNRI": 0,
   "isNRICountryCode": "",
   "product": "SCRC"
 }
 ```
 
-The CAMS flow stays:
+**Error (401):**
+```json
+{ "success": false, "message": "CAMS consent not found. Please complete the consent process before registering." }
+```
+
+The flow:
 ```
 1. GetConsentURL → user completes consent → FetchData
-2. CAMS/RegisterUser (no OTP / verificationToken needed)
+2. CAMS/RegisterUser (geoId required, no OTP needed)
 ```
 
 ## A.6 — GET /api/Holding/Get_Holdings_Before_Registration_Web  [CHANGED]
@@ -795,8 +810,7 @@ HTTP 500
 6. On `FetchData` (A.7b): send `GeoId` not `PRID`, and **branch on `status`** —
    `synced` → proceed, `processing` → retry, `no_data` → reconnect, `error` → error.
    Use `synced` (not `success`) to decide whether to show the portfolio.
-7. **★ REVERTED 2026-10-07:** CAMS/RegisterUser does NOT require
-   `verificationToken` — CAMS consent is the identity proof. No OTP step needed.
+7. CAMS/RegisterUser validates `geoId` (must resolve to a valid pre-registration). No `verificationToken` needed. Handle **401** if geoId is invalid.
 8. **★ HR-03:** Remove `Mobile` param from `FetchData` calls. Stop reading
    `panNumber`, `mobile`, `cntryCode` from the response — they are no longer returned.
 9. **★ HR-07:** Stop reading `userId` and `message` from `CheckUser` response —
@@ -865,8 +879,8 @@ The second fires when the identifier in the token != the one being registered
 (stops verifying your own number and registering another number).
 
 > **App action:** capture `verificationToken` from `verify-otp`, send it in
-> `register` / `registerusers` / `CAMS/RegisterUser`. **All three** register
-> endpoints now require it — CAMS is no longer exempt (see Part 1 §4 above).
+> `register` / `registerusers`. CAMS/RegisterUser does **not** require it —
+> CAMS consent is the identity proof.
 
 ## B.2 — Drop `activated` and `isPaid` (L3)
 
@@ -952,7 +966,7 @@ Revokes every active refresh token for the user (so a stolen token dies at
 logout) and clears the cookie. **App action:** call this on sign-out.
 
 ## B.7 — Login/Signup checklist for the app team
-1. Send `verificationToken` (from verify-otp) in register/registerusers/**CAMS RegisterUser**.
+1. Send `verificationToken` (from verify-otp) in register/registerusers (NOT CAMS/RegisterUser).
 2. Remove `activated` / `isPaid` from register payloads.
 3. Handle **429** on send-otp (add a resend cooldown).
 4. Stop calling `/auth/activate`.
