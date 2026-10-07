@@ -124,7 +124,7 @@ GetConsentURL → user completes CAMS consent → FetchData → RegisterUser (no
 
 ---
 
-## 5. Payloads and responses
+## 5. Payloads and  responses
 
 ### Step 1 — send OTP
 
